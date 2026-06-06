@@ -72,3 +72,44 @@ uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
 ```
 
 The merged checkpoint can then be used directly with `AutoModelForCausalLM.from_pretrained` or passed to the [evaluation pipeline](../guides/eval.md).
+
+
+## Exporting Megatron LoRA Adapters to PEFT Format
+
+If you want to keep the LoRA weights separate from the base model and load them with Hugging Face PEFT, use the same converter with `--adapter-only`. The output directory contains `adapter_config.json` and `adapter_model.safetensors`, suitable for `PeftModel.from_pretrained`.
+
+```sh
+uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
+    --base-ckpt <path_to_base_megatron_checkpoint>/iter_0000000 \
+    --adapter-only \
+    --adapter-ckpt <path_to_lora_adapter_checkpoint>/iter_0000000 \
+    --hf-model-name <huggingface_model_name> \
+    --hf-ckpt-path <output_path_for_peft_adapter>
+```
+
+Example:
+
+```sh
+HF_HOME=/workspace/HF_HOME \
+PYTHONPATH=/workspace/src/RL/3rdparty/Megatron-LM-workspace/Megatron-LM \
+uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
+    --base-ckpt /workspace/HF_HOME/nemo_rl/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/iter_0000000 \
+    --adapter-only \
+    --adapter-ckpt results/sft-nemotron-lora/step_600/policy/weights/iter_0000000 \
+    --hf-model-name nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
+    --hf-ckpt-path results/sft-nemotron-lora/step_600/hf_lora_adapter
+```
+
+Load the exported adapter with PEFT:
+
+```python
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
+
+base = AutoModelForCausalLM.from_pretrained(
+    "<path_or_name_of_base_hf_model>",
+    device_map="auto",
+    trust_remote_code=True,
+)
+model = PeftModel.from_pretrained(base, "<output_path_for_peft_adapter>")
+```
