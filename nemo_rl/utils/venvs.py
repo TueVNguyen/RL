@@ -29,6 +29,32 @@ DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
 
 logger = logging.getLogger(__name__)
 
+def _install_torch_nvjitlink_sitecustomize(venv_path: str) -> None:
+    site_packages_dirs = list(Path(venv_path).glob("lib/python*/site-packages"))
+    if not site_packages_dirs:
+        return
+
+    sitecustomize_path = site_packages_dirs[0] / "sitecustomize.py"
+    sitecustomize_path.write_text(
+        "\"\"\"Local startup fixes for this uv environment.\n\n"
+        "Preload PyTorch wheel-bundled nvJitLink before system CUDA libraries.\n"
+        "\"\"\"\n\n"
+        "from __future__ import annotations\n\n"
+        "import ctypes\n"
+        "from pathlib import Path\n\n"
+        "def _preload_torch_nvjitlink() -> None:\n"
+        "    site_packages = Path(__file__).resolve().parent\n"
+        "    nvjitlink = site_packages / \"nvidia\" / \"nvjitlink\" / \"lib\" / \"libnvJitLink.so.12\"\n"
+        "    if not nvjitlink.exists():\n"
+        "        return\n"
+        "    try:\n"
+        "        ctypes.CDLL(str(nvjitlink), mode=ctypes.RTLD_GLOBAL)\n"
+        "    except OSError:\n"
+        "        return\n\n"
+        "_preload_torch_nvjitlink()\n"
+    )
+
+
 
 @lru_cache(maxsize=None)
 def create_local_venv(
@@ -87,6 +113,9 @@ def create_local_venv(
     #  context.
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
+    # Ray env-builder actors run without GPU resources, but some CUDA extensions
+    # query torch.cuda during build unless an arch list is provided.
+    env.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
 
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)
@@ -95,7 +124,10 @@ def create_local_venv(
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
     subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
+    _install_torch_nvjitlink_sitecustomize(venv_path)
     subprocess.run(exec_cmd, env=env, check=True)
+    _install_torch_nvjitlink_sitecustomize(venv_path)
+    Path(venv_path, "READY_ENV_BUILDER").touch()
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
@@ -114,10 +146,12 @@ def _env_builder(
     venv_path = Path(NEMO_RL_VENV_DIR) / venv_name
     python_path = venv_path / "bin" / "python"
     started_file = venv_path / "STARTED_ENV_BUILDER"
+    ready_file = venv_path / "READY_ENV_BUILDER"
 
     # Skip early return if force_rebuild is True
-    if not force_rebuild and python_path.exists():
+    if not force_rebuild and python_path.exists() and ready_file.exists():
         logger.info(f"Using existing venv at {venv_path}")
+        _install_torch_nvjitlink_sitecustomize(str(venv_path))
         return str(python_path)
 
     # Sleep to stagger node startup
@@ -130,7 +164,7 @@ def _env_builder(
         )
         # Wait for the venv to be ready (check for python executable)
         python_path = venv_path / "bin" / "python"
-        while not python_path.exists():
+        while not python_path.exists() or not ready_file.exists():
             time.sleep(1)
         return str(python_path)
 

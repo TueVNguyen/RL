@@ -24,7 +24,7 @@ checkpointing:
   save_optimizer: true
 
 policy:
-  model_name: "meta-llama/Llama-3.2-1B"
+  model_name: "HuggingFaceTB/SmolLM2-135M"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     # chat_template can be a Jinja template string or path to a .jinja file
@@ -246,7 +246,7 @@ data:
 
 logger:
   log_dir: "logs"  # Base directory for all logs
-  wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
+  wandb_enabled: false # Set to true after running ``wandb login [Your API key]''
   tensorboard_enabled: true
   mlflow_enabled: false
   swanlab_enabled: false # Disable SwanLab logging
