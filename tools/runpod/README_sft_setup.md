@@ -17,6 +17,14 @@ What the script handles:
 - Because RunPod can share `/workspace` across pod types, put generated Ray worker venvs on local disk with `NEMO_RL_VENV_DIR=/tmp/nemo_rl_venvs`. This avoids stale file handles while `uv` installs wheels. Use `NRL_FORCE_REBUILD_VENVS=true` when switching GPU/CUDA images so generated Ray worker venvs are rebuilt.
 - Verifies `import torch` and CUDA visibility.
 
+Megatron-Bridge grouped LoRA patch:
+
+```bash
+bash tools/runpod/apply_megatron_bridge_grouped_lora_patch.sh
+```
+
+This applies `tools/runpod/megatron_bridge_grouped_lora.patch` to `3rdparty/Megatron-Bridge-workspace/Megatron-Bridge`. The patch adds grouped MoE expert LoRA support while keeping grouped GEMM, plus HF PEFT adapter export for per-expert LoRA keys.
+
 Model notes:
 
 - The original default `meta-llama/Llama-3.2-1B` is gated and needs `huggingface-cli login` plus granted model access.

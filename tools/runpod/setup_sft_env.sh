@@ -25,12 +25,19 @@ if ! command -v uv >/dev/null 2>&1; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
-# Avoid the common RunPod CUDA 12.8 system library shadowing PyTorch cu129's nvJitLink.
+# Avoid the common RunPod system CUDA library shadowing PyTorch cu129's nvJitLink.
 install_nvjitlink_sitecustomize() {
   local venv_path="$1"
   local site_packages
   site_packages="$(find "$venv_path" -maxdepth 3 -type d -path '*/site-packages' | head -n 1 || true)"
   if [[ -z "$site_packages" ]]; then
+    echo "Could not find site-packages under $venv_path; skipping nvJitLink preload hook." >&2
+    return 0
+  fi
+
+  local nvjitlink="$site_packages/nvidia/nvjitlink/lib/libnvJitLink.so.12"
+  if [[ ! -f "$nvjitlink" ]]; then
+    echo "Could not find PyTorch wheel-bundled nvJitLink at $nvjitlink; skipping preload hook." >&2
     return 0
   fi
 
@@ -56,6 +63,8 @@ def _preload_torch_nvjitlink() -> None:
 
 _preload_torch_nvjitlink()
 PY
+
+  echo "Installed nvJitLink preload hook: $site_packages/sitecustomize.py"
 }
 
 if [[ -z "$TORCH_CUDA_ARCH_LIST" ]]; then
@@ -74,7 +83,7 @@ mkdir -p "$NEMO_RL_VENV_DIR"
 uv sync --extra mcore
 install_nvjitlink_sitecustomize "$REPO_ROOT/.venv"
 
-uv run python - <<'PY'
+"$REPO_ROOT/.venv/bin/python" - <<'PY'
 import torch
 print(f"torch={torch.__version__}")
 print(f"cuda_available={torch.cuda.is_available()}")

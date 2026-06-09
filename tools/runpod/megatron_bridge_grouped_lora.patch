@@ -1,0 +1,362 @@
+# Megatron-Bridge grouped expert LoRA patch
+#
+# Apply from the Megatron-Bridge repo root:
+#   git apply /workspace/src/RL/tools/runpod/megatron_bridge_grouped_lora.patch
+#
+# Or from /workspace/src/RL:
+#   bash tools/runpod/apply_megatron_bridge_grouped_lora_patch.sh
+#
+# Purpose:
+# - Include TE grouped expert linear layers in PEFT target_modules=[] matching.
+# - Add per-expert LoRA weights for grouped MoE linear layers while keeping grouped GEMM.
+# - Export 3D grouped expert LoRA weights to HF PEFT per-expert keys.
+# - Keep the local moe_grouped_gemm toggle in the Mamba provider path.
+
+diff --git a/src/megatron/bridge/models/conversion/peft_bridge.py b/src/megatron/bridge/models/conversion/peft_bridge.py
+index 97d61995..20b76fad 100644
+--- a/src/megatron/bridge/models/conversion/peft_bridge.py
++++ b/src/megatron/bridge/models/conversion/peft_bridge.py
+@@ -465,7 +465,6 @@ class MegatronPeftBridge:
+         ep_size = parallel_state.get_expert_model_parallel_world_size()
+         if ep_size <= 1:
+             return None
+-        assert weight.ndim < 3
+ 
+         gathered = [torch.empty_like(weight) for _ in range(ep_size)]
+         torch.distributed.all_gather(gathered, weight, group=parallel_state.get_expert_model_parallel_group())
+@@ -474,13 +473,25 @@ class MegatronPeftBridge:
+     def _select_expert_adapter_weight(
+         self,
+         weight: torch.Tensor,
+-        gathered: List[torch.Tensor],
++        gathered: Optional[List[torch.Tensor]],
+         expert_idx: int,
+         num_experts: int,
+     ) -> torch.Tensor:
+-        """Select the per-expert adapter weight slice if present."""
++        """Select a single expert's adapter weight.
+ 
+-        assert weight.ndim < 3
++        Grouped LoRA stores weights as [local_experts, ...]. Legacy expert LoRA
++        stores one shared 2D tensor per EP rank.
++        """
++
++        if weight.ndim > 2:
++            if gathered is not None:
++                weight = torch.cat(gathered, dim=0)
++            if expert_idx >= weight.shape[0]:
++                raise IndexError(
++                    f"Expert index {expert_idx} is out of range for grouped LoRA weight with "
++                    f"{weight.shape[0]} expert slices"
++                )
++            return weight[expert_idx]
+ 
+         ep_size = parallel_state.get_expert_model_parallel_world_size()
+         if ep_size <= 1:
+@@ -488,6 +499,7 @@ class MegatronPeftBridge:
+ 
+         num_experts_per_rank = num_experts // ep_size
+         rank = expert_idx // num_experts_per_rank
++        assert gathered is not None
+         return gathered[rank]
+ 
+     def _megatron_global_adapters_info_all_pp_ranks(
+diff --git a/src/megatron/bridge/models/mamba/mamba_provider.py b/src/megatron/bridge/models/mamba/mamba_provider.py
+index 921276c6..cec0b7ce 100644
+--- a/src/megatron/bridge/models/mamba/mamba_provider.py
++++ b/src/megatron/bridge/models/mamba/mamba_provider.py
+@@ -15,10 +15,12 @@
+ import inspect
+ import logging
+ import warnings
++from copy import deepcopy
+ from dataclasses import dataclass, field
+ from typing import Callable, Literal, Optional, Union
+ 
+ import torch
++from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+ from megatron.core.models.mamba import MambaModel as MCoreMambaModel
+ from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec as default_mamba_stack_spec
+ from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+@@ -121,7 +123,16 @@ def get_default_mamba_stack_spec(config: "MambaModelProvider") -> ModuleSpec:
+     Returns:
+         ModuleSpec: Appropriate module specification based on config
+     """
+-    return transformer_engine_mamba_stack_spec()
++    if getattr(config, "moe_grouped_gemm", True):
++        return transformer_engine_mamba_stack_spec()
++
++    mamba_stack_spec = deepcopy(transformer_engine_mamba_stack_spec())
++    mamba_stack_spec.submodules.moe_layer.submodules.mlp = get_moe_module_spec(
++        use_te=True,
++        num_experts=config.num_moe_experts,
++        moe_grouped_gemm=False,
++    )
++    return mamba_stack_spec
+ 
+ 
+ @dataclass
+diff --git a/src/megatron/bridge/peft/lora.py b/src/megatron/bridge/peft/lora.py
+index 180d6e7f..4780f599 100644
+--- a/src/megatron/bridge/peft/lora.py
++++ b/src/megatron/bridge/peft/lora.py
+@@ -26,7 +26,9 @@ from megatron.core.utils import unwrap_model
+ 
+ from megatron.bridge.peft.base import PEFT
+ from megatron.bridge.peft.lora_layers import (
++    GroupedLinearAdapter,
+     LinearAdapter,
++    LoRAGroupedLinear,
+     LoRALinear,
+     LoRATopKRouter,
+     TEFusedLoRALinear,
+@@ -34,7 +36,15 @@ from megatron.bridge.peft.lora_layers import (
+     patch_linear_module,
+ )
+ from megatron.bridge.peft.module_matcher import ModuleMatcher
+-from megatron.bridge.peft.utils import ParallelLinearAdapter, get_adapter_attributes_from_linear, is_expert_linear
++from megatron.bridge.peft.utils import (
++    HAVE_TE_COL_GRP_LINEAR,
++    HAVE_TE_ROW_GRP_LINEAR,
++    ParallelLinearAdapter,
++    TEColumnParallelGroupedLinear,
++    TERowParallelGroupedLinear,
++    get_adapter_attributes_from_linear,
++    is_expert_linear,
++)
+ 
+ 
+ logger = logging.getLogger(__name__)
+@@ -125,7 +135,7 @@ class LoRA(PEFT, ModuleMatcher):
+             nn.Module: The modified module with LoRA applied, or the original module if not a target.
+         """
+         # Skip already transformed modules
+-        adapter_types = (LinearAdapter, LoRALinear, LoRATopKRouter)
++        adapter_types = (LinearAdapter, LoRALinear, LoRAGroupedLinear, LoRATopKRouter)
+         adapter_types = adapter_types + (TELinearAdapter,)
+         if isinstance(module, adapter_types):
+             return module
+@@ -158,10 +168,33 @@ class LoRA(PEFT, ModuleMatcher):
+                 )
+ 
+             is_expert = is_expert_linear(full_name)
++            is_grouped_linear = (
++                (HAVE_TE_COL_GRP_LINEAR and isinstance(module, TEColumnParallelGroupedLinear))
++                or (HAVE_TE_ROW_GRP_LINEAR and isinstance(module, TERowParallelGroupedLinear))
++            )
+             attrs = get_adapter_attributes_from_linear(module, is_expert=is_expert)
+ 
+             dim = self._get_effective_dim(module, is_expert)
+ 
++            if is_grouped_linear:
++                base_weight = getattr(module, "weight0", None)
++                adapter = GroupedLinearAdapter(
++                    num_experts=module.num_gemms,
++                    in_features=attrs.in_features,
++                    out_features=attrs.out_features,
++                    dim=dim,
++                    base_linear_name=full_name,
++                    alpha=self.alpha,
++                    dropout=self.dropout,
++                    dropout_position=self.dropout_position,
++                    lora_A_init_method=self.lora_A_init_method,
++                    lora_B_init_method=self.lora_B_init_method,
++                    lora_dtype=self.lora_dtype,
++                    base_weight=base_weight,
++                )
++                logging.info(f"Adding grouped expert lora to: {full_name}")
++                return LoRAGroupedLinear(module, adapter)
++
+             enable_op_fuser = (
+                 hasattr(module, "config")
+                 and getattr(module.config, "use_transformer_engine_op_fuser", False)
+diff --git a/src/megatron/bridge/peft/lora_layers.py b/src/megatron/bridge/peft/lora_layers.py
+index d5404c64..16d0f5ba 100644
+--- a/src/megatron/bridge/peft/lora_layers.py
++++ b/src/megatron/bridge/peft/lora_layers.py
+@@ -18,6 +18,7 @@ from typing import Any, Literal, Optional, Tuple, Union
+ import torch
+ import torch.nn as nn
+ import transformer_engine.pytorch as te
++from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+ from megatron.core.transformer.moe.moe_utils import apply_random_logits
+ 
+ from megatron.bridge.peft.adapter_wrapper import AdapterWrapper
+@@ -31,6 +32,146 @@ else:
+     HAVE_BNB = False
+ 
+ 
++class _GroupedAdapterLinear(nn.Module):
++    """Parameter container exposing a .weight like Linear for adapter export."""
++
++    def __init__(self, num_experts: int, out_features: int, in_features: int, *, dtype, device):
++        super().__init__()
++        self.weight = nn.Parameter(torch.empty(num_experts, out_features, in_features, dtype=dtype, device=device))
++
++
++def _normalize_lora_dtype(dtype: Optional[Union[str, torch.dtype]]) -> Optional[torch.dtype]:
++    if dtype is None or isinstance(dtype, torch.dtype):
++        return dtype
++    if not isinstance(dtype, str):
++        raise TypeError(f"Expected torch.dtype, str, or None for LoRA dtype, got {type(dtype)}")
++
++    normalized = dtype.removeprefix("torch.").lower()
++    if normalized in {"none", "null"}:
++        return None
++    if normalized in {"bfloat16", "bf16", "bf16-mixed"}:
++        return torch.bfloat16
++    if normalized in {"float16", "fp16", "half", "fp16-mixed"}:
++        return torch.float16
++    if normalized in {"float32", "fp32", "float"}:
++        return torch.float32
++
++    # Adapter weights cannot be allocated in TE fp8 wrapper dtypes.
++    if "float8" in normalized or "fp8" in normalized:
++        return torch.bfloat16
++
++    raise ValueError(f"Unsupported LoRA dtype string: {dtype}")
++
++
++class GroupedLinearAdapter(nn.Module):
++    """Per-expert LoRA adapter for TE grouped expert linear layers.
++
++    The base TE grouped linear keeps the fast grouped GEMM path. This adapter adds
++    a low-rank delta with separate A/B matrices for each local expert.
++    """
++
++    def __init__(
++        self,
++        num_experts: int,
++        in_features: int,
++        out_features: int,
++        dim: int,
++        base_linear_name: str,
++        alpha: int = 32,
++        dropout: float = 0.0,
++        dropout_position: Literal["pre", "post"] = "pre",
++        lora_A_init_method: Literal["xavier", "uniform"] = "xavier",
++        lora_B_init_method: Literal["zero", "xavier", "uniform"] = "zero",
++        lora_dtype: Optional[torch.dtype] = None,
++        base_weight: Optional[torch.Tensor] = None,
++    ) -> None:
++        super().__init__()
++        self.num_experts = num_experts
++        self.in_features = in_features
++        self.out_features = out_features
++        self.dim = dim
++        self.alpha = alpha
++        self.scale = alpha / dim
++        self.base_linear_name = base_linear_name
++        self.dropout_position = dropout_position
++
++        lora_dtype = _normalize_lora_dtype(lora_dtype)
++
++        if base_weight is None:
++            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++            dtype = lora_dtype or torch.get_default_dtype()
++        else:
++            device = base_weight.device
++            dtype = lora_dtype or _normalize_lora_dtype(base_weight.dtype) or torch.get_default_dtype()
++
++        self.linear_in = _GroupedAdapterLinear(num_experts, dim, in_features, dtype=dtype, device=device)
++        self.linear_out = _GroupedAdapterLinear(num_experts, out_features, dim, dtype=dtype, device=device)
++
++        if lora_A_init_method == "xavier":
++            for expert_idx in range(num_experts):
++                nn.init.xavier_uniform_(self.linear_in.weight.data[expert_idx])
++        else:
++            for expert_idx in range(num_experts):
++                nn.init.kaiming_uniform_(self.linear_in.weight.data[expert_idx], a=math.sqrt(5))
++
++        if lora_B_init_method == "zero":
++            self.linear_out.weight.data.fill_(0)
++        elif lora_B_init_method == "xavier":
++            for expert_idx in range(num_experts):
++                nn.init.xavier_uniform_(self.linear_out.weight.data[expert_idx])
++        else:
++            for expert_idx in range(num_experts):
++                nn.init.kaiming_uniform_(self.linear_out.weight.data[expert_idx], a=math.sqrt(5))
++
++        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
++        assert dropout_position in ["pre", "post"], dropout_position
++
++    def forward(self, x: torch.Tensor, tokens_per_expert: list[int]) -> torch.Tensor:
++        if self.dropout_position == "pre":
++            x = self.dropout(x)
++
++        chunks = torch.split(x, tokens_per_expert, dim=0)
++        outputs = []
++        for expert_idx, chunk in enumerate(chunks):
++            if chunk.numel() == 0:
++                continue
++            hidden = torch.matmul(chunk, self.linear_in.weight[expert_idx].t())
++            out = torch.matmul(hidden, self.linear_out.weight[expert_idx].t())
++            outputs.append(out)
++
++        if outputs:
++            y = torch.cat(outputs, dim=0)
++        else:
++            y = x.new_zeros((0, self.out_features))
++
++        if self.dropout_position == "post":
++            y = self.dropout(y)
++        y = y * self.scale
++
++        # Keep all expert adapter parameters in the autograd graph even when an
++        # expert receives no tokens in this microbatch.
++        return y + (self.linear_in.weight.sum() + self.linear_out.weight.sum()) * 0.0
++
++    def sharded_state_dict(self, prefix: str = "", sharded_offsets: Tuple = (), metadata: Optional[dict] = None):
++        state_dict = {
++            "linear_in.weight": self.linear_in.weight,
++            "linear_out.weight": self.linear_out.weight,
++        }
++        return make_sharded_tensors_for_checkpoint(state_dict, prefix, {}, sharded_offsets)
++
++
++class LoRAGroupedLinear(AdapterWrapper):
++    """LoRA wrapper for TE grouped expert linear layers."""
++
++    def forward(self, x: torch.Tensor, tokens_per_expert: list[int], *args: Any, **kwargs: Any):
++        linear_output, bias = self.to_wrap(x, tokens_per_expert, *args, **kwargs)
++        if not self._adapter_enabled:
++            return linear_output, bias
++        adapter_output = self.adapter(x.contiguous(), tokens_per_expert)
++        adapter_output = adapter_output.reshape(linear_output.shape)
++        return linear_output + adapter_output, bias
++
++
+ class LoRALinear(AdapterWrapper):
+     """An adapter wrapper that adds the output of the adapter to the output of the wrapped module.
+ 
+diff --git a/src/megatron/bridge/peft/module_matcher.py b/src/megatron/bridge/peft/module_matcher.py
+index cc979079..51498183 100644
+--- a/src/megatron/bridge/peft/module_matcher.py
++++ b/src/megatron/bridge/peft/module_matcher.py
+@@ -30,9 +30,15 @@ TELayerNormColumnParallelLinear, HAVE_TE_LN_COL_LINEAR = safe_import_from(
+     "megatron.core.extensions.transformer_engine",
+     "TELayerNormColumnParallelLinear",
+ )
++TEColumnParallelGroupedLinear, HAVE_TE_COL_GRP_LINEAR = safe_import_from(
++    "megatron.core.extensions.transformer_engine", "TEColumnParallelGroupedLinear"
++)
+ TERowParallelLinear, HAVE_TE_ROW_LINEAR = safe_import_from(
+     "megatron.core.extensions.transformer_engine", "TERowParallelLinear"
+ )
++TERowParallelGroupedLinear, HAVE_TE_ROW_GRP_LINEAR = safe_import_from(
++    "megatron.core.extensions.transformer_engine", "TERowParallelGroupedLinear"
++)
+ HAVE_TE = all((HAVE_TE_COL_LINEAR, HAVE_TE_LN_COL_LINEAR, HAVE_TE_ROW_LINEAR))
+ 
+ 
+@@ -122,6 +128,10 @@ class ModuleMatcher:
+                 linear_types.append(TELayerNormColumnParallelLinear)
+             if HAVE_TE_ROW_LINEAR:
+                 linear_types.append(TERowParallelLinear)
++            if HAVE_TE_COL_GRP_LINEAR:
++                linear_types.append(TEColumnParallelGroupedLinear)
++            if HAVE_TE_ROW_GRP_LINEAR:
++                linear_types.append(TERowParallelGroupedLinear)
+             linear_types = tuple(linear_types)
+ 
+             if (
