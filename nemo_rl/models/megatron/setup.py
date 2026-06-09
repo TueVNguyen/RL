@@ -430,6 +430,9 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         "moe_shared_expert_overlap"
     ]
 
+    if "moe_grouped_gemm" in config["megatron_cfg"]:
+        model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
+
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
 

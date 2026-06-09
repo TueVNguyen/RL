@@ -48,6 +48,8 @@ from contextlib import contextmanager
 
 import yaml
 
+import nemo_rl  # noqa: F401 - importing NeMo RL adds Megatron-LM to sys.path
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s"
 )
@@ -159,7 +161,7 @@ def _build_megatron_model_with_lora(
             lora_B_init_method=peft_section.get("lora_B_init_method", "zero"),
             a2a_experimental=peft_section.get("a2a_experimental", False),
         )
-
+        print(peft_section)
         logger.info(
             "Building base model on CPU (LoRA wrappers applied after base weights are loaded)..."
         )
